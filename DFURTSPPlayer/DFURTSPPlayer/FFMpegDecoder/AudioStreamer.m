@@ -1,6 +1,10 @@
 #import "AudioStreamer.h"
 #import "RTSPPlayer.h"
 
+static NSUInteger const levelMonitorBufferSize = 100;
+static Float32 levelMonitorBuffer[levelMonitorBufferSize];
+static NSUInteger levelMonitorBufferPointer = 0;
+
 void audioQueueOutputCallback(void *inClientData, AudioQueueRef inAQ,
   AudioQueueBufferRef inBuffer);
 
@@ -24,6 +28,7 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
 @interface AudioStreamer ()
 @property (nonatomic, weak) RTSPPlayer *streamer;
 @property (nonatomic, assign) AVCodecContext *audioCodecContext;
+@property (nonatomic, strong) NSTimer *levelMonitorTimer;
 @end
 
 @implementation AudioStreamer
@@ -37,6 +42,11 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
         [audioSession setCategory:AVAudioSessionCategoryPlayback error:nil];
         _streamer = streamer;
         _audioCodecContext = _streamer._audioCodecContext;
+        self.levelMonitorTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                                  target:self
+                                                                selector:@selector(monitorAudioLevelAndRestartAQIfNeeded)
+                                                                userInfo:nil
+                                                                 repeats:YES];
     }
     
     return  self;
@@ -44,6 +54,8 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
 
 - (void)dealloc
 {
+    [_levelMonitorTimer invalidate];
+    
     [self removeAudioQueue];
 }
 
@@ -168,6 +180,12 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
       NSLog(@"Could not create new output.");
       return NO;
     }
+    UInt32 val = 1;
+    OSStatus status2 = AudioQueueSetProperty(audioQueue_, kAudioQueueProperty_EnableLevelMetering, &val, sizeof(UInt32));
+    if(status2!=noErr)
+    {
+        printf("Error enabling level metering\n");
+    }
 
     status = AudioQueueAddPropertyListener(audioQueue_, kAudioQueueProperty_IsRunning, audioQueueIsRunningCallback, (__bridge void*)self);
     if (status != noErr) {
@@ -228,6 +246,19 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
     }
 }
 
+- (Float32)audioAveragePower {
+    UInt32 expectedSize = sizeof(AudioQueueLevelMeterState);
+    assert(expectedSize>0);
+    AudioQueueLevelMeterState* audioLevels = (AudioQueueLevelMeterState*)malloc(sizeof(AudioQueueLevelMeterState));
+    OSStatus status = AudioQueueGetProperty(audioQueue_,kAudioQueueProperty_CurrentLevelMeter, audioLevels, &expectedSize);
+    if(status!=noErr)
+    {
+        printf("Error getting the average power: error code %i",status);
+        return 0;
+    }
+    return audioLevels->mAveragePower;
+}
+
 - (OSStatus)enqueueBuffer:(AudioQueueBufferRef)buffer
 {
     OSStatus status = noErr;
@@ -282,6 +313,11 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
         [decodeLock_ lock];
         if (buffer->mPacketDescriptionCount > 0) {
             status = AudioQueueEnqueueBuffer(audioQueue_, buffer, 0, NULL);
+            levelMonitorBuffer[levelMonitorBufferPointer] = [self audioAveragePower];
+            levelMonitorBufferPointer++;
+            if (levelMonitorBufferPointer >= levelMonitorBufferSize) {
+                levelMonitorBufferPointer = 0;
+            }
             if (status != noErr) {
                 NSLog(@"Could not enqueue buffer.");
             }
@@ -294,6 +330,21 @@ void audioQueueIsRunningCallback(void *inClientData, AudioQueueRef inAQ,
     }
     
     return status;
+}
+
+- (void)monitorAudioLevelAndRestartAQIfNeeded {
+    if (levelMonitorBufferPointer > 0) {
+        Float32 sum = 0;
+        for (int i = 0; i < levelMonitorBufferPointer; i++) {
+            sum = sum + levelMonitorBuffer[i];
+        }
+        levelMonitorBufferPointer = 0;
+        if (sum <= 0) {
+            NSLog(@"Restarting audio...");
+            [self pauseAudio:nil];
+            [self playAudio:nil];
+        }
+    }
 }
 
 - (OSStatus)startQueue
